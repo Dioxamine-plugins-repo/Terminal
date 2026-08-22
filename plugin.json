@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.rhythmcache.dioxamine.xtermterminal",
+  "name": "Terminal",
+  "description": "Interactive PTY terminal powered by xterm.js",
+  "version": "1.0.0",
+  "versionCode": 1,
+  "author": "rhythmcache",
+  "entry": "index.html",
+  "icon": "icon.png",
+  "minAppVersionCode": 1,
+  "permissions": ["shell"],
+  "fullscreen": true
+}
