@@ -118,7 +118,9 @@ async function createTab() {
 
 async function openSessionForTab(tab) {
     try {
-        const session = await dioxamine.openInteractiveShell();
+        const session = await (dioxamine.adb && dioxamine.adb.openInteractiveShell
+            ? dioxamine.adb.openInteractiveShell()
+            : dioxamine.openInteractiveShell());
 
         // tab may have been closed while this await was pending don't
         // resurrect a session onto a disposed tab, just clean it up
