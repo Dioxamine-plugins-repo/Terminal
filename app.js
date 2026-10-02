@@ -46,6 +46,70 @@ function applyThemeToAllTerms() {
     }
 }
 
+function triggerHaptic(type = 'selection') {
+    try {
+        if (window.dioxamine && dioxamine.haptics) {
+            if (type === 'toggle') {
+                dioxamine.haptics.impact('medium');
+            } else if (type === 'impact') {
+                dioxamine.haptics.impact('light');
+            } else {
+                dioxamine.haptics.selection();
+            }
+        } else if (window.dioxamine && typeof dioxamine.vibrate === 'function') {
+            dioxamine.vibrate(type === 'toggle' ? 35 : 20);
+        } else if (navigator && typeof navigator.vibrate === 'function') {
+            navigator.vibrate(type === 'toggle' ? 35 : 20);
+        }
+    } catch (e) {}
+}
+
+function exitTerminalPlugin() {
+    try {
+        if (window.dioxamine && typeof dioxamine.exitPlugin === 'function') {
+            dioxamine.exitPlugin();
+        } else if (window.dioxamine && typeof dioxamine.closePlugin === 'function') {
+            dioxamine.closePlugin();
+        } else if (window.DioxamineNative && typeof window.DioxamineNative.exitPlugin === 'function') {
+            window.DioxamineNative.exitPlugin();
+        }
+    } catch (e) {
+        console.error('Failed to exit plugin:', e);
+    }
+}
+
+let isLegacyAndroid = false;
+let activeDeviceChecked = false;
+
+async function checkDeviceCompatibility() {
+    if (activeDeviceChecked) return isLegacyAndroid;
+    try {
+        if (window.dioxamine && dioxamine.adb && dioxamine.adb.getActiveDevice) {
+            const dev = await Promise.race([
+                dioxamine.adb.getActiveDevice(),
+                new Promise((resolve) => setTimeout(() => resolve(null), 1000)),
+            ]);
+            if (dev) {
+                // Interactive Shell v2 is only supported on Android 7.0+ (API 24+)
+                if (dev.supportsShellV2 === false) {
+                    isLegacyAndroid = true;
+                } else if (typeof dev.apiLevel === 'number' && dev.apiLevel > 0 && dev.apiLevel < 24) {
+                    isLegacyAndroid = true;
+                } else if (dev.androidVersion) {
+                    const major = parseInt(dev.androidVersion, 10);
+                    if (!isNaN(major) && major > 0 && major < 7) {
+                        isLegacyAndroid = true;
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('Failed to query device compatibility:', e);
+    }
+    activeDeviceChecked = true;
+    return isLegacyAndroid;
+}
+
 const tabs = new Map(); // id -> { id, title, term, fitAddon, session, container, tabEl, alive }
 let activeTabId = null;
 let tabCounter = 0;
@@ -73,6 +137,7 @@ async function createTab() {
         '<span class="tab-title">Shell ' + tabCounter + '</span>' +
         (isFirstTab ? '' : '<span class="tab-close">&times;</span>');
     tabEl.addEventListener('click', (e) => {
+        triggerHaptic('selection');
         if (e.target.classList.contains('tab-close')) {
             closeTab(id);
         } else {
@@ -87,6 +152,7 @@ async function createTab() {
         fontSize: 14,
         theme: buildXtermTheme(),
         allowProposedApi: true,
+        convertEol: isLegacyAndroid,
     });
     const FitAddonCtor = getFitAddonCtor();
     const fitAddon = new FitAddonCtor();
@@ -118,6 +184,14 @@ async function createTab() {
 
 async function openSessionForTab(tab) {
     try {
+        if (!activeDeviceChecked) {
+            await checkDeviceCompatibility();
+        }
+
+        if (isLegacyAndroid) {
+            tab.term.options.convertEol = true;
+        }
+
         const session = await (dioxamine.adb && dioxamine.adb.openInteractiveShell
             ? dioxamine.adb.openInteractiveShell()
             : dioxamine.openInteractiveShell());
@@ -139,6 +213,15 @@ async function openSessionForTab(tab) {
             if (!tab.alive || !tabs.has(tab.id)) return;
             tab.alive = false;
             tab.term.writeln('\r\n\x1b[31m[Session closed' + (err ? ': ' + err : '') + ']\x1b[0m');
+
+            const hasOtherAlive = Array.from(tabs.values()).some((t) => t.id !== tab.id && t.alive);
+            setTimeout(() => {
+                if (hasOtherAlive) {
+                    closeTab(tab.id, true);
+                } else {
+                    exitTerminalPlugin();
+                }
+            }, 150);
         });
 
         tab.term.onData((data) => {
@@ -149,6 +232,14 @@ async function openSessionForTab(tab) {
 
         // send initial dimensions
         session.resize(tab.term.cols, tab.term.rows);
+
+        if (isLegacyAndroid) {
+            const cols = tab.term.cols || 80;
+            const rows = tab.term.rows || 24;
+            const initCmd = `stty rows ${rows} cols ${cols} 2>/dev/null; export TERM=xterm LINES=${rows} COLUMNS=${cols}\n`;
+            session.write(utf8ToBase64(initCmd));
+            tab.term.writeln('\x1b[33m[Legacy Android (API < 24) detected: terminal adjusted for shell v1]\x1b[0m\r\n');
+        }
     } catch (e) {
         tab.term.writeln('\x1b[31mFailed to open shell: ' + (e && e.message ? e.message : e) + '\x1b[0m');
         if (window.dioxamine && dioxamine.log) dioxamine.log.e('Terminal', 'openInteractiveShell failed: ' + e);
@@ -176,10 +267,10 @@ function activateTab(id) {
     });
 }
 
-function closeTab(id) {
+function closeTab(id, force = false) {
     const tab = tabs.get(id);
     if (!tab) return;
-    if (!tab.closable) return;
+    if (!tab.closable && !force) return;
 
     tab.alive = false;
 
@@ -191,18 +282,21 @@ function closeTab(id) {
     tab.tabEl.remove();
     tabs.delete(id);
 
-    if (activeTabId === id) {
-        const remaining = Array.from(tabs.keys());
-        if (remaining.length > 0) {
+    const remaining = Array.from(tabs.keys());
+    if (remaining.length > 0) {
+        if (activeTabId === id) {
             activateTab(remaining[remaining.length - 1]);
-        } else {
-            activeTabId = null;
-            createTab();
         }
+    } else {
+        activeTabId = null;
+        exitTerminalPlugin();
     }
 }
 
-newTabBtn.addEventListener('click', () => createTab());
+newTabBtn.addEventListener('click', () => {
+    triggerHaptic('selection');
+    createTab();
+});
 
 const resizeObserver = new ResizeObserver(() => {
     const tab = tabs.get(activeTabId);
@@ -264,15 +358,19 @@ keybarEl.addEventListener('click', (e) => {
     if (btn.id === 'ctrl-btn') {
         ctrlSticky = !ctrlSticky;
         btn.classList.toggle('sticky-active', ctrlSticky);
+        triggerHaptic('toggle');
         refocusActiveTerm();
         return;
     }
     if (btn.id === 'alt-btn') {
         altSticky = !altSticky;
         btn.classList.toggle('sticky-active', altSticky);
+        triggerHaptic('toggle');
         refocusActiveTerm();
         return;
     }
+
+    triggerHaptic('selection');
 
     const key = btn.getAttribute('data-key');
     if (key) {
@@ -329,6 +427,7 @@ function initThemeSync() {
 
 async function boot() {
     initThemeSync();
+    await checkDeviceCompatibility();
     await createTab();
 }
 
